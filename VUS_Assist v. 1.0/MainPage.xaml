@@ -1,0 +1,46 @@
+﻿<Page x:Class="VUS_Assist_v._1._0.MainPage"
+      xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+      xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+      Title="Редактор базы данных">
+    <Grid Margin="10">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- Панель управления -->
+        <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,10">
+            <Button Content="Открыть файл .db" Width="150" Height="30" Click="OpenDb_Click" Margin="0,0,10,0"/>
+            <Button Content="Сохранить изменения" Width="180" Height="30" Click="SaveDb_Click" IsEnabled="False" x:Name="BtnSave"/>
+            <TextBlock x:Name="TxtFilePath" VerticalAlignment="Center" Margin="20,0,0,0" Foreground="Gray" TextWrapping="Wrap"/>
+        </StackPanel>
+
+        <!-- Таблица -->
+        <DataGrid Grid.Row="1" x:Name="DataGridMain" 
+                  AutoGenerateColumns="False" 
+                  CanUserAddRows="False" 
+                  CanUserDeleteRows="False"
+                  IsReadOnly="False"
+                  HeadersVisibility="Column"
+                  GridLinesVisibility="All"
+                  AlternatingRowBackground="#F9F9F9"/>
+
+        <!-- Панель статистики -->
+        <Border Grid.Row="2" Background="#F0F0F0" Padding="10" Margin="0,10,0,5" CornerRadius="4">
+            <StackPanel Orientation="Horizontal">
+                <TextBlock Text="Статистика:" FontWeight="Bold" VerticalAlignment="Center" Margin="0,0,15,0"/>
+                <TextBlock Text="Всего записей: " VerticalAlignment="Center"/>
+                <TextBlock x:Name="TxtTotal" FontWeight="Bold" Foreground="DarkBlue" VerticalAlignment="Center" Margin="0,0,20,0"/>
+                <TextBlock Text="Сдали ВЭК: " VerticalAlignment="Center"/>
+                <TextBlock x:Name="TxtVec" FontWeight="Bold" Foreground="Green" VerticalAlignment="Center" Margin="0,0,20,0"/>
+                <TextBlock Text="Подготовлено: " VerticalAlignment="Center"/>
+                <TextBlock x:Name="TxtPrepared" FontWeight="Bold" Foreground="DarkOrange" VerticalAlignment="Center"/>
+            </StackPanel>
+        </Border>
+
+        <!-- Строка статуса -->
+        <TextBlock Grid.Row="3" x:Name="TxtStatus" Margin="0,5,0,0" Foreground="Green" FontWeight="Bold"/>
+    </Grid>
+</Page>

@@ -1,0 +1,65 @@
+﻿<Page x:Class="VUS_Assist_v._1._0.LogsPage"
+      xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+      xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+      Title="Логи приложения">
+    <Grid Margin="10">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- Заголовок -->
+        <TextBlock Grid.Row="0" Text="Журнал событий приложения" 
+                   FontSize="24" FontWeight="Bold" Margin="0,0,0,15"/>
+
+        <!-- Панель фильтров и управления -->
+        <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,10">
+            <TextBlock Text="Фильтр по тегу:" VerticalAlignment="Center" Margin="0,0,10,0"/>
+            <ComboBox x:Name="CmbTagFilter" Width="150" Height="28" 
+                      SelectionChanged="CmbTagFilter_SelectionChanged">
+                <ComboBoxItem Content="Все" IsSelected="True"/>
+                <ComboBoxItem Content="[INFO]"/>
+                <ComboBoxItem Content="[ERROR]"/>
+                <ComboBoxItem Content="[WARN]"/>
+                <ComboBoxItem Content="[DB]"/>
+                <ComboBoxItem Content="[GEN]"/>
+                <ComboBoxItem Content="[UI]"/>
+                <ComboBoxItem Content="[SUCCESS]"/>
+            </ComboBox>
+
+            <TextBlock Text="Поиск:" VerticalAlignment="Center" Margin="20,0,10,0"/>
+            <TextBox x:Name="TxtSearch" Width="200" Height="28" 
+                     TextChanged="TxtSearch_TextChanged" VerticalContentAlignment="Center"/>
+
+            <Button Content="Очистить логи" Width="120" Height="28" 
+                    Margin="20,0,10,0" Click="ClearLogs_Click"
+                    Background="#E74C3C" Foreground="White"/>
+
+            <Button Content="Экспорт в файл" Width="130" Height="28" 
+                    Click="ExportLogs_Click"
+                    Background="#27AE60" Foreground="White"/>
+        </StackPanel>
+
+        <!-- Список логов -->
+        <ListView Grid.Row="2" x:Name="LvLogs" 
+                  FontFamily="Consolas" FontSize="12"
+                  ScrollViewer.HorizontalScrollBarVisibility="Auto">
+            <ListView.View>
+                <GridView>
+                    <GridViewColumn Header="Время" Width="100" 
+                                    DisplayMemberBinding="{Binding Timestamp, StringFormat=HH:mm:ss.fff}"/>
+                    <GridViewColumn Header="Тег" Width="80" 
+                                    DisplayMemberBinding="{Binding Tag, StringFormat=[{0}]}"/>
+                    <GridViewColumn Header="Сообщение" Width="1200" 
+                                    DisplayMemberBinding="{Binding Message}"/>
+                </GridView>
+            </ListView.View>
+        </ListView>
+
+        <!-- Статусная строка -->
+        <TextBlock Grid.Row="3" x:Name="TxtStatus" Margin="0,5,0,0" 
+                   Foreground="Gray" FontWeight="Bold"/>
+    </Grid>
+</Page>

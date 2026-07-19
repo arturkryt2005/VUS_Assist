@@ -1,0 +1,37 @@
+﻿<Window x:Class="VUS_Assist_v._1._0.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="VUS Assist v1.0" Height="Auto" Width="1100" WindowStartupLocation="CenterScreen" Background="White"
+        ResizeMode="CanMinimize">
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <!-- Панель навигации -->
+        <Grid Grid.Row="0" Background="#F4395B00">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition/>
+                <ColumnDefinition/>
+            </Grid.ColumnDefinitions>
+            <StackPanel Orientation="Horizontal" Grid.Column="0">
+                <Button Content="Просмотр БД" Margin="10" Padding="10"
+                        Click="NavigateToMain_Click" x:Name="BtnMain" 
+                        Background="#FFB10A0A" Foreground="White" FontFamily="Cascadia Mono SemiLight" FontSize="14"/>
+                <Button Content="Добавление ВЭК/ГИБДД" Padding="10" Margin="10" 
+                        Click="NavigateToAdding_Click" x:Name="BtnAdding"
+                        Background="#FF2C6300" Foreground="White" FontFamily="Cascadia Mono SemiLight" FontSize="14"/>
+                <Button Content="Логи" Padding="10" Margin="10" 
+                        Click="NavigateToLogs_Click" x:Name="BtnLogs"
+                        Background="#FF2C6300" Foreground="White" FontFamily="Cascadia Mono SemiLight" FontSize="14"/>
+            </StackPanel>
+
+            <Image Grid.Column="1" Source="/logo.png" Height="40" Margin="10" HorizontalAlignment="Right" VerticalAlignment="Center"/>
+
+        </Grid>
+
+        <!-- Frame для отображения страниц -->
+        <Frame Grid.Row="1" x:Name="MainFrame" NavigationUIVisibility="Hidden"/>
+    </Grid>
+</Window>
