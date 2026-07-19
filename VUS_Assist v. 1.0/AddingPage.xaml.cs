@@ -1,8 +1,13 @@
 ﻿using Microsoft.Data.Sqlite;
+using Microsoft.Win32;
 using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.IO.Compression;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Xml.Linq;
 using System.Linq;
 using System.Windows;
 using System.Windows.Controls;
@@ -93,6 +98,429 @@ namespace VUS_Assist_v._1._0
                 TxtPreparedStatus.Foreground = System.Windows.Media.Brushes.Red;
             }
         }
+
+
+        private class SentImportRow
+        {
+            public int RowNumber { get; set; }
+            public string LastName { get; set; } = "";
+            public string FirstName { get; set; } = "";
+            public string Patronymic { get; set; } = "";
+            public string BirthDate { get; set; } = "";
+            public string SentDate { get; set; } = "";
+            public string TrainingType { get; set; } = "";
+            public string SpecialtyText { get; set; } = "";
+            public string SpecialtyCode { get; set; } = "";
+            public string DriverLicenseNumber { get; set; } = "";
+        }
+
+        private class ImportReportRow
+        {
+            public int RowNumber { get; set; }
+            public string FullName { get; set; } = "";
+            public string BirthDate { get; set; } = "";
+            public string SentDate { get; set; } = "";
+            public string Training { get; set; } = "";
+            public string Status { get; set; } = "";
+            public string RecruitCode { get; set; } = "";
+            public string Comment { get; set; } = "";
+        }
+
+        private void ImportSent_Click(object sender, RoutedEventArgs e)
+        {
+            if (!AppData.IsDbLoaded)
+            {
+                TxtImportStatus.Text = "Ошибка: сначала загрузите базу данных на странице 'Редактор БД'!";
+                TxtImportStatus.Foreground = Brushes.Red;
+                return;
+            }
+
+            var openDialog = new OpenFileDialog
+            {
+                Filter = "Excel (*.xlsx)|*.xlsx|Все файлы (*.*)|*.*",
+                Title = "Выберите Excel со списком отправленных"
+            };
+
+            if (openDialog.ShowDialog() != true)
+                return;
+
+            try
+            {
+                var rows = ReadSentRowsFromXlsx(openDialog.FileName);
+                var report = ImportSentRows(rows);
+                var reportPath = SaveImportReport(report, openDialog.FileName);
+
+                int updated = report.Count(r => r.Status == "обновлен");
+                int inserted = report.Count(r => r.Status == "добавлен");
+                int skipped = report.Count(r => r.Status == "уже отправлен");
+                int errors = report.Count(r => r.Status == "ошибка");
+
+                TxtImportStatus.Text = $"Готово. Обновлено: {updated}, добавлено: {inserted}, уже отправлены: {skipped}, ошибок: {errors}. Отчет: {reportPath}";
+                TxtImportStatus.Foreground = errors == 0 ? Brushes.Green : Brushes.DarkOrange;
+                ShowNotification($"Импорт отправленных завершён. Обновлено: {updated}, добавлено: {inserted}, уже отправлены: {skipped}, ошибок: {errors}");
+            }
+            catch (Exception ex)
+            {
+                TxtImportStatus.Text = $"Ошибка импорта: {ex.Message}";
+                TxtImportStatus.Foreground = Brushes.Red;
+            }
+        }
+
+        private List<ImportReportRow> ImportSentRows(List<SentImportRow> rows)
+        {
+            var report = new List<ImportReportRow>();
+
+            using (var connection = new SqliteConnection($"Data Source={AppData.DbPath}"))
+            {
+                connection.Open();
+                string defaultMunicipalCode = GetDefaultMunicipalCode(connection);
+
+                using (var transaction = connection.BeginTransaction())
+                {
+                    try
+                    {
+                        foreach (var row in rows)
+                        {
+                            var reportRow = new ImportReportRow
+                            {
+                                RowNumber = row.RowNumber,
+                                FullName = $"{row.LastName} {row.FirstName} {row.Patronymic}".Trim(),
+                                BirthDate = row.BirthDate,
+                                SentDate = row.SentDate,
+                                Training = $"{row.TrainingType} {row.SpecialtyText} {row.SpecialtyCode}".Trim()
+                            };
+
+                            if (string.IsNullOrWhiteSpace(row.LastName) || string.IsNullOrWhiteSpace(row.FirstName) ||
+                                string.IsNullOrWhiteSpace(row.BirthDate) || string.IsNullOrWhiteSpace(row.SentDate))
+                            {
+                                reportRow.Status = "ошибка";
+                                reportRow.Comment = "не заполнены обязательные поля Excel: фамилия, имя, дата рождения или отправка";
+                                report.Add(reportRow);
+                                continue;
+                            }
+
+                            string? recruitCode = FindRecruitCode(connection, transaction, row);
+                            bool inserted = false;
+                            if (recruitCode == null)
+                            {
+                                recruitCode = InsertRecruit(connection, transaction, row, defaultMunicipalCode);
+                                inserted = true;
+                            }
+
+                            reportRow.RecruitCode = recruitCode;
+
+                            if (IsAlreadySent(connection, transaction, recruitCode))
+                            {
+                                reportRow.Status = "уже отправлен";
+                                reportRow.Comment = "запись не изменялась";
+                                report.Add(reportRow);
+                                continue;
+                            }
+
+                            DateTime sentDate = ParseDate(row.SentDate);
+                            string callDate = sentDate.AddDays(-_random.Next(14, 22)).ToString(DATE_FORMAT);
+
+                            UpsertSummons(connection, transaction, recruitCode, callDate);
+                            UpsertCommission(connection, transaction, recruitCode, callDate);
+                            UpsertTraining(connection, transaction, recruitCode, row, sentDate);
+                            MarkRecruitSent(connection, transaction, recruitCode, row.SentDate);
+
+                            reportRow.Status = inserted ? "добавлен" : "обновлен";
+                            reportRow.Comment = $"дата вызова/комиссии: {callDate}";
+                            report.Add(reportRow);
+                        }
+
+                        transaction.Commit();
+                    }
+                    catch
+                    {
+                        transaction.Rollback();
+                        throw;
+                    }
+                }
+            }
+
+            Logger.Success($"Импорт отправленных: обработано {report.Count} строк");
+            return report;
+        }
+
+        private string GetDefaultMunicipalCode(SqliteConnection connection)
+        {
+            using var command = new SqliteCommand("SELECT address_municipal_code FROM recruitment WHERE address_municipal_code IS NOT NULL AND address_municipal_code != '' LIMIT 1", connection);
+            return command.ExecuteScalar()?.ToString() ?? "00000000";
+        }
+
+        private string? FindRecruitCode(SqliteConnection connection, SqliteTransaction transaction, SentImportRow row)
+        {
+            const string query = @"SELECT code FROM recruitment
+WHERE lower(pers_second_name) = lower(@lastName)
+  AND lower(pers_name) = lower(@firstName)
+  AND ifnull(lower(pers_patronimic), '') = lower(@patronymic)
+  AND pers_birth_date = @birthDate
+LIMIT 1";
+            using var command = new SqliteCommand(query, connection, transaction);
+            command.Parameters.AddWithValue("@lastName", row.LastName);
+            command.Parameters.AddWithValue("@firstName", row.FirstName);
+            command.Parameters.AddWithValue("@patronymic", row.Patronymic);
+            command.Parameters.AddWithValue("@birthDate", row.BirthDate);
+            return command.ExecuteScalar()?.ToString();
+        }
+
+        private string InsertRecruit(SqliteConnection connection, SqliteTransaction transaction, SentImportRow row, string municipalCode)
+        {
+            string code;
+            do
+            {
+                code = municipalCode + DateTime.Now.ToString("ddMMyyyy") + _random.Next(100000, 999999).ToString();
+            }
+            while (RecruitExists(connection, transaction, code));
+
+            const string query = @"INSERT INTO recruitment
+(code, card_create_date, pers_second_name, pers_name, pers_patronimic, pers_birth_date, address_municipal_code)
+VALUES (@code, @cardDate, @lastName, @firstName, @patronymic, @birthDate, @municipalCode)";
+            using var command = new SqliteCommand(query, connection, transaction);
+            command.Parameters.AddWithValue("@code", code);
+            command.Parameters.AddWithValue("@cardDate", DateTime.Now.ToString(DATE_FORMAT));
+            command.Parameters.AddWithValue("@lastName", row.LastName);
+            command.Parameters.AddWithValue("@firstName", row.FirstName);
+            command.Parameters.AddWithValue("@patronymic", string.IsNullOrWhiteSpace(row.Patronymic) ? DBNull.Value : row.Patronymic);
+            command.Parameters.AddWithValue("@birthDate", row.BirthDate);
+            command.Parameters.AddWithValue("@municipalCode", municipalCode);
+            command.ExecuteNonQuery();
+            return code;
+        }
+
+        private bool RecruitExists(SqliteConnection connection, SqliteTransaction transaction, string code)
+        {
+            using var command = new SqliteCommand("SELECT 1 FROM recruitment WHERE code = @code LIMIT 1", connection, transaction);
+            command.Parameters.AddWithValue("@code", code);
+            return command.ExecuteScalar() != null;
+        }
+
+        private bool IsAlreadySent(SqliteConnection connection, SqliteTransaction transaction, string recruitCode)
+        {
+            using var command = new SqliteCommand("SELECT ap_arrival_date FROM recruitment WHERE code = @code", connection, transaction);
+            command.Parameters.AddWithValue("@code", recruitCode);
+            var value = command.ExecuteScalar()?.ToString();
+            return !string.IsNullOrWhiteSpace(value);
+        }
+
+        private void MarkRecruitSent(SqliteConnection connection, SqliteTransaction transaction, string recruitCode, string sentDate)
+        {
+            using var command = new SqliteCommand("UPDATE recruitment SET ap_arrival_date = @sentDate WHERE code = @code", connection, transaction);
+            command.Parameters.AddWithValue("@sentDate", sentDate);
+            command.Parameters.AddWithValue("@code", recruitCode);
+            command.ExecuteNonQuery();
+        }
+
+        private void UpsertSummons(SqliteConnection connection, SqliteTransaction transaction, string recruitCode, string callDate)
+        {
+            int code = GetNextChildCode(connection, transaction, "log_summonses", recruitCode);
+            const string query = "INSERT INTO log_summonses (code, status_code, recruit_code, arrival_date, reason_code) VALUES (@code, 1, @recruitCode, @date, 3)";
+            using var command = new SqliteCommand(query, connection, transaction);
+            command.Parameters.AddWithValue("@code", code);
+            command.Parameters.AddWithValue("@recruitCode", recruitCode);
+            command.Parameters.AddWithValue("@date", callDate);
+            command.ExecuteNonQuery();
+        }
+
+        private void UpsertCommission(SqliteConnection connection, SqliteTransaction transaction, string recruitCode, string commissionDate)
+        {
+            int code = GetNextChildCode(connection, transaction, "recruit_commissions", recruitCode);
+            const string query = @"INSERT INTO recruit_commissions
+(code, status_code, recruit_code, commission_type, arrival_date, decision_code, protocol_date, med_category_code)
+VALUES (@code, 1, @recruitCode, 2, @date, 1, @date, @medCategory)";
+            using var command = new SqliteCommand(query, connection, transaction);
+            command.Parameters.AddWithValue("@code", code);
+            command.Parameters.AddWithValue("@recruitCode", recruitCode);
+            command.Parameters.AddWithValue("@date", commissionDate);
+            command.Parameters.AddWithValue("@medCategory", _random.Next(1, 3));
+            command.ExecuteNonQuery();
+        }
+
+
+        private void UpsertTraining(SqliteConnection connection, SqliteTransaction transaction, string recruitCode, SentImportRow row, DateTime sentDate)
+        {
+            int? typeCode = ResolveTrainingType(row.TrainingType);
+            string? specialtyCode = ResolveSpecialtyCode(connection, transaction, row.SpecialtyCode, row.SpecialtyText);
+            if (typeCode == null && specialtyCode == null)
+                return;
+
+            int code = GetExistingTrainingCode(connection, transaction, recruitCode) ?? GetNextChildCode(connection, transaction, "recruit_training", recruitCode);
+            string graduationDate = sentDate.AddDays(-_random.Next(14, 31)).ToString(DATE_FORMAT);
+            var existingCards = GetExistingNumbers(connection, "card_number");
+            var existingLicenses = GetExistingNumbers(connection, "license_number");
+            string cardNumber = GenerateUniqueVecNumber(existingCards);
+            string protocolNumber = _random.Next(1000, 999999).ToString();
+            bool isDriver = IsDriverSpecialty(row.SpecialtyText, specialtyCode);
+            string? licenseNumber = null;
+            string? licenseDate = null;
+            if (isDriver)
+            {
+                licenseNumber = string.IsNullOrWhiteSpace(row.DriverLicenseNumber) || row.DriverLicenseNumber == "-"
+                    ? GenerateUniquePreparedNumber(existingLicenses)
+                    : row.DriverLicenseNumber;
+                licenseDate = sentDate.AddDays(-_random.Next(3, 11)).ToString(DATE_FORMAT);
+            }
+
+            const string query = @"INSERT INTO recruit_training
+(code, status_code, recruit_code, specialty_code, type_code, graduation_date, card_number, protocol_date, protocol_number, license_date, license_number)
+VALUES (@code, 1, @recruitCode, @specialtyCode, @typeCode, @graduationDate, @cardNumber, @protocolDate, @protocolNumber, @licenseDate, @licenseNumber)
+ON CONFLICT(code, recruit_code) DO UPDATE SET
+    specialty_code = coalesce(excluded.specialty_code, specialty_code),
+    type_code = coalesce(excluded.type_code, type_code),
+    graduation_date = coalesce(nullif(graduation_date, ''), excluded.graduation_date),
+    card_number = coalesce(nullif(card_number, ''), excluded.card_number),
+    protocol_date = coalesce(nullif(protocol_date, ''), excluded.protocol_date),
+    protocol_number = coalesce(nullif(protocol_number, ''), excluded.protocol_number),
+    license_date = CASE WHEN excluded.license_date IS NOT NULL THEN coalesce(nullif(license_date, ''), excluded.license_date) ELSE license_date END,
+    license_number = CASE WHEN excluded.license_number IS NOT NULL THEN coalesce(nullif(license_number, ''), excluded.license_number) ELSE license_number END";
+
+            using var command = new SqliteCommand(query, connection, transaction);
+            command.Parameters.AddWithValue("@code", code);
+            command.Parameters.AddWithValue("@recruitCode", recruitCode);
+            command.Parameters.AddWithValue("@specialtyCode", (object?)specialtyCode ?? DBNull.Value);
+            command.Parameters.AddWithValue("@typeCode", (object?)typeCode ?? DBNull.Value);
+            command.Parameters.AddWithValue("@graduationDate", graduationDate);
+            command.Parameters.AddWithValue("@cardNumber", cardNumber);
+            command.Parameters.AddWithValue("@protocolDate", graduationDate);
+            command.Parameters.AddWithValue("@protocolNumber", protocolNumber);
+            command.Parameters.AddWithValue("@licenseDate", (object?)licenseDate ?? DBNull.Value);
+            command.Parameters.AddWithValue("@licenseNumber", (object?)licenseNumber ?? DBNull.Value);
+            command.ExecuteNonQuery();
+        }
+
+        private int? GetExistingTrainingCode(SqliteConnection connection, SqliteTransaction transaction, string recruitCode)
+        {
+            using var command = new SqliteCommand("SELECT code FROM recruit_training WHERE recruit_code = @recruitCode AND status_code = 1 LIMIT 1", connection, transaction);
+            command.Parameters.AddWithValue("@recruitCode", recruitCode);
+            var value = command.ExecuteScalar();
+            return value == null ? null : Convert.ToInt32(value);
+        }
+
+        private int? ResolveTrainingType(string trainingType)
+        {
+            string normalized = trainingType.Trim().ToUpperInvariant();
+            if (normalized.Contains("ДОСААФ")) return 1;
+            if (normalized.Contains("СПО")) return 2;
+            if (normalized.Contains("САМО")) return 3;
+            return null;
+        }
+
+        private string? ResolveSpecialtyCode(SqliteConnection connection, SqliteTransaction transaction, string excelCode, string specialtyText)
+        {
+            string digits = Regex.Replace(excelCode ?? "", "\\D", "");
+            if (digits.Length == 6)
+                return digits;
+            if (string.IsNullOrWhiteSpace(specialtyText))
+                return null;
+            using var command = new SqliteCommand("SELECT code FROM r_xrt_specialties WHERE lower(name) LIKE lower(@name) AND actuality = 1 LIMIT 1", connection, transaction);
+            command.Parameters.AddWithValue("@name", $"%{specialtyText.Trim()}%");
+            return command.ExecuteScalar()?.ToString();
+        }
+
+        private bool IsDriverSpecialty(string specialtyText, string? specialtyCode)
+        {
+            string text = (specialtyText ?? "").ToLowerInvariant();
+            if (text.Contains("параш") || text.Contains("мед"))
+                return false;
+            if (text.Contains("водител") || text.Contains("категории c") || text.Contains("категории с"))
+                return true;
+            return !string.IsNullOrWhiteSpace(specialtyCode) && specialtyCode.EndsWith("037", StringComparison.Ordinal);
+        }
+
+        private int GetNextChildCode(SqliteConnection connection, SqliteTransaction transaction, string tableName, string recruitCode)
+        {
+            using var command = new SqliteCommand($"SELECT ifnull(max(code), 0) + 1 FROM {tableName} WHERE recruit_code = @recruitCode", connection, transaction);
+            command.Parameters.AddWithValue("@recruitCode", recruitCode);
+            return Convert.ToInt32(command.ExecuteScalar());
+        }
+
+        private List<SentImportRow> ReadSentRowsFromXlsx(string path)
+        {
+            var cells = ReadWorksheetCells(path);
+            var rows = new List<SentImportRow>();
+            foreach (var rowGroup in cells.GroupBy(c => c.Row).Where(g => g.Key > 1).OrderBy(g => g.Key))
+            {
+                string lastName = GetCell(rowGroup, "A");
+                string firstName = GetCell(rowGroup, "B");
+                string patronymic = GetCell(rowGroup, "C");
+                string birthDate = NormalizeExcelDate(GetCell(rowGroup, "D"));
+                string sentDate = NormalizeExcelDate(GetCell(rowGroup, "F"));
+                string trainingType = GetCell(rowGroup, "I");
+                string specialtyText = GetCell(rowGroup, "M");
+                string specialtyCode = GetCell(rowGroup, "N");
+                string driverLicenseNumber = GetCell(rowGroup, "P");
+                if (string.IsNullOrWhiteSpace(lastName) && string.IsNullOrWhiteSpace(firstName) && string.IsNullOrWhiteSpace(sentDate))
+                    continue;
+                rows.Add(new SentImportRow { RowNumber = rowGroup.Key, LastName = lastName.Trim(), FirstName = firstName.Trim(), Patronymic = patronymic.Trim(), BirthDate = birthDate, SentDate = sentDate, TrainingType = trainingType.Trim(), SpecialtyText = specialtyText.Trim(), SpecialtyCode = specialtyCode.Trim(), DriverLicenseNumber = driverLicenseNumber.Trim() });
+            }
+            return rows;
+        }
+
+        private static string GetCell(IEnumerable<(int Row, string Column, string Value)> row, string column) =>
+            row.FirstOrDefault(c => c.Column == column).Value ?? "";
+
+        private static List<(int Row, string Column, string Value)> ReadWorksheetCells(string path)
+        {
+            using var archive = ZipFile.OpenRead(path);
+            XNamespace ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+            var shared = new List<string>();
+            var sharedEntry = archive.GetEntry("xl/sharedStrings.xml");
+            if (sharedEntry != null)
+            {
+                using var stream = sharedEntry.Open();
+                var doc = XDocument.Load(stream);
+                shared = doc.Descendants(ns + "si").Select(si => string.Concat(si.Descendants(ns + "t").Select(t => t.Value))).ToList();
+            }
+
+            var sheetEntry = archive.GetEntry("xl/worksheets/sheet1.xml") ?? throw new Exception("В Excel не найден первый лист");
+            using var sheetStream = sheetEntry.Open();
+            var sheet = XDocument.Load(sheetStream);
+            return sheet.Descendants(ns + "c").Select(c =>
+            {
+                string reference = c.Attribute("r")?.Value ?? "";
+                string column = Regex.Match(reference, "[A-Z]+").Value;
+                int row = int.Parse(Regex.Match(reference, "[0-9]+").Value);
+                string value = c.Element(ns + "v")?.Value ?? "";
+                if (c.Attribute("t")?.Value == "s" && int.TryParse(value, out int idx) && idx >= 0 && idx < shared.Count)
+                    value = shared[idx];
+                return (row, column, value);
+            }).ToList();
+        }
+
+        private string NormalizeExcelDate(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return "";
+            value = value.Trim();
+            if (double.TryParse(value, NumberStyles.Any, CultureInfo.InvariantCulture, out double oa))
+                return DateTime.FromOADate(oa).ToString(DATE_FORMAT);
+            return ParseDate(value).ToString(DATE_FORMAT);
+        }
+
+        private DateTime ParseDate(string value)
+        {
+            string[] formats = { DATE_FORMAT, "d.M.yyyy", "M/d/yy", "M/d/yyyy", "yyyy-MM-dd" };
+            if (DateTime.TryParseExact(value, formats, CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime date))
+                return date;
+            if (DateTime.TryParse(value, CultureInfo.GetCultureInfo("ru-RU"), DateTimeStyles.None, out date))
+                return date;
+            throw new Exception($"Не удалось распознать дату: {value}");
+        }
+
+        private string SaveImportReport(List<ImportReportRow> report, string sourcePath)
+        {
+            string reportPath = Path.Combine(Path.GetDirectoryName(sourcePath) ?? Environment.CurrentDirectory, $"sent_import_report_{DateTime.Now:yyyyMMdd_HHmmss}.csv");
+            var sb = new StringBuilder();
+            sb.AppendLine("Строка;ФИО;Дата рождения;Дата отправки;Подготовка;Статус;Код;Комментарий");
+            foreach (var row in report)
+                sb.AppendLine(string.Join(";", EscapeCsv(row.RowNumber.ToString()), EscapeCsv(row.FullName), EscapeCsv(row.BirthDate), EscapeCsv(row.SentDate), EscapeCsv(row.Training), EscapeCsv(row.Status), EscapeCsv(row.RecruitCode), EscapeCsv(row.Comment)));
+            File.WriteAllText(reportPath, sb.ToString(), Encoding.UTF8);
+            return reportPath;
+        }
+
+        private static string EscapeCsv(string value) => $"\"{(value ?? "").Replace("\"", "\"\"")}\"";
 
         // Метод для показа уведомления со звуком
         private void ShowNotification(string message)
