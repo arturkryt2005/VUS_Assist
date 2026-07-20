@@ -134,9 +134,12 @@ namespace VUS_Assist_v._1._0
             public string BirthDate { get; set; } = "";
             public string SentDate { get; set; } = "";
             public string TrainingType { get; set; } = "";      // Вид подготовки (ДОСААФ, СПО...)
+            public string CategoryText { get; set; } = "";      // Категория/спецтехника (столбец L: С, Д, Е, МТ-ЛБ, Парашютист)
             public string SpecialtyText { get; set; } = "";     // Текст специальности
             public string SpecialtyCode { get; set; } = "";     // Код специальности
             public string EduOrganization { get; set; } = "";   // Учебная организация
+            public string VkText { get; set; } = "";            // Текст военкомата (столбец J)
+            public string DriverLicenseSeries { get; set; } = ""; // Серия прав (столбец O)
             public string DriverLicenseNumber { get; set; } = "";
         }
 
@@ -229,7 +232,13 @@ namespace VUS_Assist_v._1._0
                             bool inserted = false;
                             if (recruitCode == null)
                             {
-                                recruitCode = InsertRecruit(connection, transaction, row, defaultMunicipalCode);
+                                // Пытаемся определить настоящий муниципальный код по тексту
+                                // военкомата из файла (столбец J) — иначе всем новым записям
+                                // ставился один и тот же муниципальный код (первый попавшийся
+                                // в базе), что неверно, если в файле люди из разных районов.
+                                string municipalCode = ResolveMunicipalCode(connection, transaction, row.VkText)
+                                                        ?? defaultMunicipalCode;
+                                recruitCode = InsertRecruit(connection, transaction, row, municipalCode);
                                 inserted = true;
                             }
 
@@ -238,9 +247,11 @@ namespace VUS_Assist_v._1._0
                             // ВАЖНО: "дата отправки" хранится в recruitment.ap_departure_date
                             // (эта дата совпадает с ap_order_date — датой приказа об отправке —
                             // во всех существующих записях базы, это и есть искомое поле).
-                            // ap_arrival_date — ДРУГОЕ поле (дата прибытия на сборный пункт),
-                            // оно уже используется в базе для не связанных с этим импортом целей,
-                            // поэтому его больше не трогаем и не используем для проверки дубликатов.
+                            // ap_arrival_date (дата прибытия на сборный пункт) мы теперь тоже
+                            // проставляем (пара дней до отправки), но проверка дубликатов идёт
+                            // строго по ap_departure_date — у части призывников в ap_arrival_date
+                            // уже стояли посторонние значения до этого импорта, и завязывать на
+                            // него проверку "уже отправлен" по-прежнему нельзя.
                             if (IsAlreadySent(connection, transaction, recruitCode, row.SentDate))
                             {
                                 reportRow.Status = "уже отправлен";
@@ -251,11 +262,13 @@ namespace VUS_Assist_v._1._0
 
                             DateTime sentDate = ParseDate(row.SentDate);
                             string callDate = sentDate.AddDays(-_random.Next(14, 22)).ToString(DATE_FORMAT);
+                            // Прибытие на сборный пункт — за 3-4 дня до отправки.
+                            string arrivalDate = sentDate.AddDays(-_random.Next(3, 5)).ToString(DATE_FORMAT);
 
                             UpsertSummons(connection, transaction, recruitCode, callDate);
                             UpsertCommission(connection, transaction, recruitCode, callDate);
                             UpsertTraining(connection, transaction, recruitCode, row, sentDate);
-                            MarkRecruitSent(connection, transaction, recruitCode, row.SentDate);
+                            UpdateRecruitDispatchInfo(connection, transaction, recruitCode, row.SentDate, arrivalDate, row.EduOrganization);
 
                             reportRow.Status = inserted ? "добавлен" : "обновлен";
                             reportRow.Comment = $"дата вызова/комиссии: {callDate}";
@@ -280,6 +293,61 @@ namespace VUS_Assist_v._1._0
         {
             using var command = new SqliteCommand("SELECT address_municipal_code FROM recruitment WHERE address_municipal_code IS NOT NULL AND address_municipal_code != '' LIMIT 1", connection);
             return command.ExecuteScalar()?.ToString() ?? "00000000";
+        }
+
+        // Пытаемся определить реальный муниципальный код (recruitment.address_municipal_code)
+        // по тексту военкомата из Excel (столбец J, напр. "ВК города Альметьевск и
+        // Альметьевского района Республики Татарстан, г. Альметьевск").
+        // r_dep_military_commissariats.name — это укороченная версия того же текста
+        // (без "Республики Татарстан, г. ..." в конце), поэтому ищем её как подстроку.
+        // Дальше через r_dep_municipalities.mc_municipal_code (код группы военкомата)
+        // находим любой муниципальный код этой группы — он нужен только чтобы потом
+        // (в ResolveDosaafOrgCode) найти, в какую автошколу обычно направляли людей
+        // из этого же военкомата.
+        // Кэш справочника военкоматов, чтобы не читать его заново на каждую строку файла
+        private List<(string Code, string NormalizedName)>? _commissariatsCache;
+
+        // ВАЖНО: сравнение делаем в C#, а не в SQL — встроенная SQLite-функция lower()
+        // работает только с ASCII и не понимает кириллицу, поэтому LIKE lower(...) 
+        // молча не находил бы часть военкоматов с иным регистром/пунктуацией.
+        private static string NormalizeForMatch(string value) =>
+            (value ?? "").ToLowerInvariant().Replace(",", "").Replace("-", "").Replace("  ", " ").Trim();
+
+        private string? ResolveMunicipalCode(SqliteConnection connection, SqliteTransaction transaction, string vkText)
+        {
+            if (string.IsNullOrWhiteSpace(vkText))
+                return null;
+
+            if (_commissariatsCache == null)
+            {
+                _commissariatsCache = new List<(string, string)>();
+                using var listCmd = new SqliteCommand("SELECT code, name FROM r_dep_military_commissariats", connection, transaction);
+                using var reader = listCmd.ExecuteReader();
+                while (reader.Read())
+                {
+                    _commissariatsCache.Add((reader.GetString(0), NormalizeForMatch(reader.GetString(1))));
+                }
+            }
+
+            string vkNormalized = NormalizeForMatch(vkText);
+
+            // Берём военкомат, чьё (нормализованное) название целиком входит в текст
+            // из файла, предпочитая самое длинное/специфичное совпадение.
+            string? commissariatCode = _commissariatsCache
+                .Where(c => vkNormalized.Contains(c.NormalizedName))
+                .OrderByDescending(c => c.NormalizedName.Length)
+                .Select(c => (string?)c.Code)
+                .FirstOrDefault();
+
+            if (string.IsNullOrEmpty(commissariatCode))
+                return null;
+
+            using var municipalCmd = new SqliteCommand(@"
+                SELECT code FROM r_dep_municipalities
+                WHERE mc_municipal_code = @commissariatCode
+                LIMIT 1", connection, transaction);
+            municipalCmd.Parameters.AddWithValue("@commissariatCode", commissariatCode);
+            return municipalCmd.ExecuteScalar()?.ToString();
         }
 
         private string? FindRecruitCode(SqliteConnection connection, SqliteTransaction transaction, SentImportRow row)
@@ -344,10 +412,21 @@ VALUES (@code, @cardDate, @lastName, @firstName, @patronymic, @birthDate, @munic
             return string.Equals(value.Trim(), sentDateFromFile.Trim(), StringComparison.OrdinalIgnoreCase);
         }
 
-        private void MarkRecruitSent(SqliteConnection connection, SqliteTransaction transaction, string recruitCode, string sentDate)
+        // Пишем дату отправки (ap_departure_date), дату прибытия на сборный пункт
+        // (ap_arrival_date, за 1-3 дня до отправки) и учебную организацию/часть
+        // (edu_org, берётся из столбца K файла). edu_org обновляем только если
+        // в файле для этой строки реально есть значение — иначе не затираем то,
+        // что уже было в базе.
+        private void UpdateRecruitDispatchInfo(SqliteConnection connection, SqliteTransaction transaction, string recruitCode, string sentDate, string arrivalDate, string eduOrg)
         {
-            using var command = new SqliteCommand("UPDATE recruitment SET ap_departure_date = @sentDate WHERE code = @code", connection, transaction);
+            using var command = new SqliteCommand(@"UPDATE recruitment SET
+                ap_departure_date = @sentDate,
+                ap_arrival_date = @arrivalDate,
+                edu_org = CASE WHEN @eduOrg != '' THEN @eduOrg ELSE edu_org END
+                WHERE code = @code", connection, transaction);
             command.Parameters.AddWithValue("@sentDate", sentDate);
+            command.Parameters.AddWithValue("@arrivalDate", arrivalDate);
+            command.Parameters.AddWithValue("@eduOrg", eduOrg ?? "");
             command.Parameters.AddWithValue("@code", recruitCode);
             command.ExecuteNonQuery();
         }
@@ -381,7 +460,7 @@ VALUES (@code, 1, @recruitCode, 2, @date, 1, @date, @medCategory)";
         private void UpsertTraining(SqliteConnection connection, SqliteTransaction transaction, string recruitCode, SentImportRow row, DateTime sentDate)
         {
             int? typeCode = ResolveTrainingType(row.TrainingType);
-            string? specialtyCode = ResolveSpecialtyCode(connection, transaction, row.SpecialtyCode, row.SpecialtyText);
+            string? specialtyCode = ResolveSpecialtyCode(connection, transaction, row.SpecialtyCode, row.SpecialtyText, row.CategoryText, typeCode);
 
             if (typeCode == null && specialtyCode == null)
                 return;
@@ -403,22 +482,39 @@ VALUES (@code, 1, @recruitCode, 2, @date, 1, @date, @medCategory)";
 
             if (isDriver)
             {
-                licenseNumber = string.IsNullOrWhiteSpace(row.DriverLicenseNumber) || row.DriverLicenseNumber == "-"
-                    ? GenerateUniquePreparedNumber(existingLicenses)
-                    : row.DriverLicenseNumber;
+                // В базе license_number хранится как "серия номер" (напр. "9949 062171") —
+                // серия в столбце O файла, номер в столбце P. Раньше сюда шёл только
+                // номер (P) без серии.
+                bool hasSeries = !string.IsNullOrWhiteSpace(row.DriverLicenseSeries) && row.DriverLicenseSeries != "-";
+                bool hasNumber = !string.IsNullOrWhiteSpace(row.DriverLicenseNumber) && row.DriverLicenseNumber != "-";
+
+                licenseNumber = (hasSeries && hasNumber)
+                    ? $"{row.DriverLicenseSeries} {row.DriverLicenseNumber}"
+                    : GenerateUniquePreparedNumber(existingLicenses);
 
                 licenseDate = sentDate.AddDays(-_random.Next(3, 11)).ToString(DATE_FORMAT);
             }
 
+            // Автошкола (org_code -> r_edu_training_schools) нужна только для пути
+            // ДОСААФ (typeCode == 1) — для СПО/самостоятельного пути её не проставляем.
+            // Жёсткого правила "военкомат -> автошкола" в данных нет (по одному и тому
+            // же военкомату исторически направляли в разные школы), поэтому берём
+            // школу, которая чаще всего встречалась у уже внесённых призывников из
+            // того же военкомата — это наиболее вероятный, а не гарантированный вариант.
+            int? orgCode = typeCode == 1
+                ? ResolveDosaafOrgCode(connection, transaction, recruitCode)
+                : null;
+
             const string query = @"
         INSERT INTO recruit_training 
-        (code, status_code, recruit_code, specialty_code, type_code, graduation_date, 
+        (code, status_code, recruit_code, specialty_code, type_code, org_code, graduation_date, 
          card_number, protocol_date, protocol_number, license_date, license_number)
-        VALUES (@code, 1, @recruitCode, @specialtyCode, @typeCode, @graduationDate, 
+        VALUES (@code, 1, @recruitCode, @specialtyCode, @typeCode, @orgCode, @graduationDate, 
                 @cardNumber, @protocolDate, @protocolNumber, @licenseDate, @licenseNumber)
         ON CONFLICT(code, recruit_code) DO UPDATE SET
             specialty_code = coalesce(excluded.specialty_code, specialty_code),
             type_code = coalesce(excluded.type_code, type_code),
+            org_code = coalesce(org_code, excluded.org_code),
             graduation_date = coalesce(nullif(graduation_date, ''), excluded.graduation_date),
             card_number = coalesce(nullif(card_number, ''), excluded.card_number),
             protocol_date = coalesce(nullif(protocol_date, ''), excluded.protocol_date),
@@ -431,6 +527,7 @@ VALUES (@code, 1, @recruitCode, 2, @date, 1, @date, @medCategory)";
             command.Parameters.AddWithValue("@recruitCode", recruitCode);
             command.Parameters.AddWithValue("@specialtyCode", (object?)specialtyCode ?? DBNull.Value);
             command.Parameters.AddWithValue("@typeCode", (object?)typeCode ?? DBNull.Value);
+            command.Parameters.AddWithValue("@orgCode", (object?)orgCode ?? DBNull.Value);
             command.Parameters.AddWithValue("@graduationDate", graduationDate);
             command.Parameters.AddWithValue("@cardNumber", cardNumber);
             command.Parameters.AddWithValue("@protocolDate", graduationDate);
@@ -439,6 +536,39 @@ VALUES (@code, 1, @recruitCode, 2, @date, 1, @date, @medCategory)";
             command.Parameters.AddWithValue("@licenseNumber", (object?)licenseNumber ?? DBNull.Value);
 
             command.ExecuteNonQuery();
+        }
+
+        // Ищет автошколу (org_code), в которую чаще всего направляли призывников из
+        // того же военкомата (той же группы r_dep_municipalities.mc_municipal_code),
+        // что и текущий призывник, среди уже внесённых записей recruit_training.
+        // Возвращает null, если прецедентов нет — тогда org_code просто остаётся пустым.
+        private int? ResolveDosaafOrgCode(SqliteConnection connection, SqliteTransaction transaction, string recruitCode)
+        {
+            using var groupCmd = new SqliteCommand(@"
+                SELECT rdm.mc_municipal_code
+                FROM recruitment r
+                JOIN r_dep_municipalities rdm ON rdm.code = r.address_municipal_code
+                WHERE r.code = @recruitCode", connection, transaction);
+            groupCmd.Parameters.AddWithValue("@recruitCode", recruitCode);
+            string? mcGroup = groupCmd.ExecuteScalar()?.ToString();
+
+            if (string.IsNullOrEmpty(mcGroup))
+                return null;
+
+            using var orgCmd = new SqliteCommand(@"
+                SELECT rt.org_code
+                FROM recruit_training rt
+                JOIN recruitment r2 ON r2.code = rt.recruit_code
+                JOIN r_dep_municipalities rdm2 ON rdm2.code = r2.address_municipal_code
+                WHERE rdm2.mc_municipal_code = @mcGroup
+                  AND rt.org_code IS NOT NULL
+                  AND rt.status_code = 1
+                GROUP BY rt.org_code
+                ORDER BY COUNT(*) DESC
+                LIMIT 1", connection, transaction);
+            orgCmd.Parameters.AddWithValue("@mcGroup", mcGroup);
+            var result = orgCmd.ExecuteScalar();
+            return result == null ? (int?)null : Convert.ToInt32(result);
         }
 
         private int? GetExistingTrainingCode(SqliteConnection connection, SqliteTransaction transaction, string recruitCode)
@@ -458,16 +588,57 @@ VALUES (@code, 1, @recruitCode, 2, @date, 1, @date, @medCategory)";
             return null;
         }
 
-        private string? ResolveSpecialtyCode(SqliteConnection connection, SqliteTransaction transaction, string excelCode, string specialtyText)
+        // Категория (столбец L) -> код специальности в r_xrt_specialties, на случай если
+        // столбцы M/N её не содержат. Используется ТОЛЬКО для ДОСААФ (typeCode == 1) —
+        // именно там нужна специальность независимо от того, водитель человек или нет
+        // (например МТ-ЛБ — это не про водительские права, но специальность нужна тоже).
+        private static readonly Dictionary<string, string> CATEGORY_TO_SPECIALTY = new(StringComparer.OrdinalIgnoreCase)
         {
+            ["С"] = "837037",       // водитель автомобилей категории «C»
+            ["Д"] = "845037",       // водитель автомобилей категории «Д»
+            ["Е"] = "846037",       // водитель автомобилей категории «E»
+            ["МТ-ЛБ"] = "843258",   // механик-водитель плавающих гусеничных тягачей МТЛБ
+            ["Парашютист"] = "837100" // водитель-парашютист
+        };
+
+        private string? ResolveSpecialtyCode(SqliteConnection connection, SqliteTransaction transaction,
+            string excelCode, string specialtyText, string categoryText, int? typeCode)
+        {
+            // 1) Код из файла (столбец N) — но проверяем, что он реально существует
+            //    в справочнике, а не просто похож на код (в файле встречается, например,
+            //    несуществующий код "837038" — раньше он записался бы как есть).
             string digits = Regex.Replace(excelCode ?? "", "\\D", "");
-            if (digits.Length == 6)
+            if (digits.Length == 6 && SpecialtyCodeExists(connection, transaction, digits))
                 return digits;
-            if (string.IsNullOrWhiteSpace(specialtyText))
-                return null;
-            using var command = new SqliteCommand("SELECT code FROM r_xrt_specialties WHERE lower(name) LIKE lower(@name) AND actuality = 1 LIMIT 1", connection, transaction);
-            command.Parameters.AddWithValue("@name", $"%{specialtyText.Trim()}%");
-            return command.ExecuteScalar()?.ToString();
+
+            // 2) Текстовое совпадение по столбцу M (срабатывает редко, т.к. там обычно
+            //    просто перечислены категории прав, а не название специальности).
+            if (!string.IsNullOrWhiteSpace(specialtyText))
+            {
+                using var command = new SqliteCommand("SELECT code FROM r_xrt_specialties WHERE lower(name) LIKE lower(@name) AND actuality = 1 LIMIT 1", connection, transaction);
+                command.Parameters.AddWithValue("@name", $"%{specialtyText.Trim()}%");
+                var byText = command.ExecuteScalar()?.ToString();
+                if (!string.IsNullOrEmpty(byText))
+                    return byText;
+            }
+
+            // 3) Для ДОСААФ, если ни код, ни текст не дали результата — подставляем
+            //    специальность по категории (столбец L), чтобы у ДОСААФ-обучавшихся
+            //    специальность была в любом случае, а не только у водителей.
+            if (typeCode == 1 && !string.IsNullOrWhiteSpace(categoryText)
+                && CATEGORY_TO_SPECIALTY.TryGetValue(categoryText.Trim(), out var fallbackCode))
+            {
+                return fallbackCode;
+            }
+
+            return null;
+        }
+
+        private bool SpecialtyCodeExists(SqliteConnection connection, SqliteTransaction transaction, string code)
+        {
+            using var command = new SqliteCommand("SELECT 1 FROM r_xrt_specialties WHERE code = @code AND actuality = 1 LIMIT 1", connection, transaction);
+            command.Parameters.AddWithValue("@code", code);
+            return command.ExecuteScalar() != null;
         }
 
         private bool IsDriverSpecialty(string specialtyText, string? specialtyCode)
@@ -499,9 +670,19 @@ VALUES (@code, 1, @recruitCode, 2, @date, 1, @date, @medCategory)";
                 string birthDate = NormalizeExcelDate(GetCell(rowGroup, "D"));
                 string sentDate = NormalizeExcelDate(GetCell(rowGroup, "F"));
                 string trainingType = GetCell(rowGroup, "I");
+                string vkText = GetCell(rowGroup, "J");
+                // Столбец L — категория/спецтехника (напр. "С", "Парашютист", "МТ-ЛБ") —
+                // используется как запасной вариант для определения специальности,
+                // когда столбцы M/N её не содержат.
+                string categoryText = GetCell(rowGroup, "L");
                 string specialtyText = GetCell(rowGroup, "M");
                 string specialtyCode = GetCell(rowGroup, "N");
-                string eduOrg = GetCell(rowGroup, "L");
+                // Реальный текст пункта направления/учебной части
+                // (напр. "ВКС, в/ч 20925 (УЧ),Белгород") лежит в столбце K.
+                string eduOrg = GetCell(rowGroup, "K");
+                // Права хранятся в БД как "серия номер" (напр. "9949 062171") —
+                // серия лежит в столбце O, номер в столбце P.
+                string driverLicenseSeries = GetCell(rowGroup, "O");
                 string driverLicense = GetCell(rowGroup, "P");
                 if (string.IsNullOrWhiteSpace(lastName) && string.IsNullOrWhiteSpace(firstName) && string.IsNullOrWhiteSpace(sentDate))
                     continue;
@@ -514,9 +695,12 @@ VALUES (@code, 1, @recruitCode, 2, @date, 1, @date, @medCategory)";
                     BirthDate = birthDate,
                     SentDate = sentDate,
                     TrainingType = trainingType.Trim(),
+                    CategoryText = categoryText.Trim(),
                     SpecialtyText = specialtyText.Trim(),
                     SpecialtyCode = specialtyCode.Trim(),
                     EduOrganization = eduOrg.Trim(),
+                    VkText = vkText.Trim(),
+                    DriverLicenseSeries = driverLicenseSeries.Trim(),
                     DriverLicenseNumber = driverLicense.Trim()
                 });
             }
